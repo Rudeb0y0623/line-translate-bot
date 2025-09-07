@@ -103,22 +103,43 @@ def convert_prices_to_kanji(text: str) -> str:
     text = _price_patterns[5].sub(dong_after, text)
     return text
 
+# --- ふりがな用・記号クレンジング設定 ---
+#   ※翻訳本文は触らない。ふりがな/ローマ字用の処理だけで記号を除去。
+_QUOTE_CHARS = r"\"\'“”‘’`´«»‹›"
+# 残したい記号（句読点や括弧など）
+_PUNCT_KEEP = set("。、！？…・（）()［］[]{}〈〉《》「」『』：；／・-—〜～")
+
+def _clean_for_reading(s: str) -> str:
+    # 全角スペースは半角へ
+    s = s.replace("\u3000", " ")
+    # 引用符は除去（きごう対策）
+    s = re.sub(f"[{_QUOTE_CHARS}]", "", s)
+    return s
+
 # --- ひらがな化（単語ごとスペース区切り） ---
 def to_hiragana(text: str, spaced: bool = False) -> str:
     text = convert_prices_to_kanji(text)
+    text = _clean_for_reading(text)
+
     tokens = _sudachi.tokenize(text, _SPLIT)
     words = []
     for t in tokens:
         pos0 = t.part_of_speech()[0]
         surf = t.surface()
 
-        if pos0 in ["記号", "補助記号", "未知語"]:
-            words.append(surf)
+        # 記号は読みを出さない（保持したい句読点のみ通す）
+        if pos0 in ["記号", "補助記号"]:
+            if surf in _PUNCT_KEEP:
+                words.append(surf)
+            # 引用符などは無視（= 追加しない）
             continue
+
+        # 英数はそのまま
         if re.fullmatch(r"[0-9A-Za-z]+", surf):
             words.append(surf)
             continue
 
+        # 読み取得
         yomi = t.reading_form()
         hira = surf if yomi == "*" else yomi.translate(_katakana_to_hira)
         words.append(hira)
