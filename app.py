@@ -57,12 +57,14 @@ def _four_digits_to_kanji(n: int) -> str:
     s = ""
     for i, u in enumerate(_UNIT1[::-1]):  # 千百十一
         d = (n // (10 ** (3 - i))) % 10
-        if d == 0: continue
+        if d == 0:
+            continue
         s += ("" if (u and d == 1) else _DIG[d]) + u
     return s or _DIG[0]
 
 def num_to_kanji(num: int) -> str:
-    if num == 0: return _DIG[0]
+    if num == 0:
+        return _DIG[0]
     parts, i = [], 0
     while num > 0 and i < len(_UNIT4):
         n = num % 10000
@@ -70,7 +72,8 @@ def num_to_kanji(num: int) -> str:
             head = _four_digits_to_kanji(n)
             if head != _DIG[0]:
                 parts.append(head + _UNIT4[i])
-        num //= 10000; i += 1
+        num //= 10000
+        i += 1
     return "".join(reversed(parts)) or _DIG[0]
 
 # --- 価格だけ（円/ドン/VND）数値→漢数字にする ---
@@ -114,21 +117,34 @@ def convert_prices_to_kanji(text: str) -> str:
     text = _price_patterns[5].sub(dong_after, text)
     return text
 
+# --- ひらがな化（ASCII英数だけ素通し・漢字は必ず読み） ---
 def to_hiragana(text: str) -> str:
     # 1) 価格だけ漢数字化（電話番号などの数字は触らない）
     text = convert_prices_to_kanji(text)
 
-    # 2) Sudachiで文脈読みを取得。記号・絵文字・英数はそのまま残す
+    # 2) Sudachiで文脈読み。記号/絵文字はそのまま、ASCII英数だけ素通し
     tokens = _sudachi.tokenize(text, _SPLIT)
     result = []
     for t in tokens:
         pos0 = t.part_of_speech()[0]
         surf = t.surface()
-        if pos0 in ["記号", "補助記号", "未知語"] or surf.isalnum():
+
+        # 記号・補助記号・未知語はそのまま
+        if pos0 in ["記号", "補助記号", "未知語"]:
             result.append(surf)
             continue
+
+        # ASCII の英数字だけそのまま（090 や ABC 等）
+        if re.fullmatch(r"[0-9A-Za-z]+", surf):
+            result.append(surf)
+            continue
+
+        # それ以外（漢字・かな等）は読みへ
         yomi = t.reading_form()
-        result.append((surf if yomi == "*" else yomi.translate(_katakana_to_hira)))
+        if yomi == "*":
+            result.append(surf)
+        else:
+            result.append(yomi.translate(_katakana_to_hira))
     return "".join(result)
 
 # --- ローマ字は「ひらがな化 → ローマ字」に一本化（誤読防止） ---
