@@ -1,5 +1,7 @@
-import os, hmac, hashlib, base64, json, requests, re, random, csv
+import os, hmac, hashlib, base64, json, requests, re
 from flask import Flask, request
+from pykakasi import kakasi
+from sudachipy import dictionary, tokenizer as sudachi_tokenizer
 
 # ====== 環境変数 ======
 LINE_CHANNEL_SECRET = os.environ["LINE_CHANNEL_SECRET"]
@@ -14,15 +16,6 @@ def verify_signature(body: bytes, signature: str) -> bool:
     expected = base64.b64encode(mac).decode("utf-8")
     return hmac.compare_digest(expected, signature)
 
-# ====== LINE返信 ======
-def reply_message(reply_token: str, texts: list[str]):
-    headers = {"Content-Type": "application/json",
-               "Authorization": f"Bearer {LINE_CHANNEL_ACCESS_TOKEN}"}
-    body = {"replyToken": reply_token,
-            "messages": [{"type": "text", "text": t[:4900]} for t in texts]}
-    requests.post("https://api.line.me/v2/bot/message/reply",
-                  headers=headers, data=json.dumps(body), timeout=15)
-
 # ====== DeepL 翻訳 ======
 def deepl_translate(text: str, target_lang: str) -> str:
     url = "https://api-free.deepl.com/v2/translate"
@@ -31,73 +24,165 @@ def deepl_translate(text: str, target_lang: str) -> str:
     r.raise_for_status()
     return r.json()["translations"][0]["text"]
 
-# ====== 言語判定 ======
+# ====== 言語判定（超簡易）→ 翻訳 ======
+VI_CHARS = set("ăâđêôơưÀÁẢÃẠĂẰẮẲẴẶÂẦẤẨẪẬĐÈÉẺẼẸÊỀẾỂỄỆ"
+               "ÌÍỈĨỊÒÓỎÕỌÔỒỐỔỖỘƠỜỚỞỠỢ"
+               "ÙÚỦŨỤƯỪỨỬỮỰ"
+               "ỲÝỶỸỴàáảãạăằắẳẵặâầấẩẫậđ"
+               "èéẻẽẹêềếểễệ"
+               "ìíỉĩị"
+               "òóỏõọôồốổỗộơờớởỡợ"
+               "ùúủũụưừứửữự"
+               "ỳýỷỹỵ")
+
 def guess_and_translate(text: str):
-    vi_chars = set("ăâđêôơưÀÁẢÃẠĂẰẮẲẴẶÂẦẤẨẪẬĐÈÉẺẼẸÊ..."
-                   "ỳýỷỹỵ")  # 短縮
-    is_vi = any(c in vi_chars for c in text.lower())
+    is_vi = any(c in VI_CHARS for c in text.lower())
     if is_vi:
-        return "VI", deepl_translate(text, "JA")
+        return "VI", deepl_translate(text, "JA")  # VI → JA
     else:
-        return "JA", deepl_translate(text, "VI")
+        return "JA", deepl_translate(text, "VI")  # JA → VI
 
-# ====== クイズデータ読込 ======
-QUIZ_FILES = {
-    "grammar": "data/Grammar.csv",
-    "meaning": "data/Meaning.csv",
-    "reading": "data/Reading.csv"
-}
-quizzes = {}
-for qtype, path in QUIZ_FILES.items():
-    try:
-        with open(path, encoding="utf-8") as f:
-            reader = csv.DictReader(f)
-            quizzes[qtype] = list(reader)
-    except:
-        quizzes[qtype] = []
+# ====== かな/ローマ字変換 ======
+_sudachi = dictionary.Dictionary().create()
+_SPLIT = sudachi_tokenizer.Tokenizer.SplitMode.C
+_katakana_to_hira = str.maketrans({chr(k): chr(k - 0x60) for k in range(ord("ァ"), ord("ヶ") + 1)})
 
-# ====== 状態管理 ======
-quiz_state = {}  # { chat_id: {"type": "grammar", "active": True, "index": 0, "questions": [...]} }
+_kakasi_roma = kakasi()
+_kakasi_roma.setMode("H", "a")  # ひらがな→ローマ字
+_converter_roma = _kakasi_roma.getConverter()
 
-def start_quiz(chat_id, qtype):
-    if qtype not in quizzes or not quizzes[qtype]:
-        return None
-    qs = random.sample(quizzes[qtype], len(quizzes[qtype]))
-    quiz_state[chat_id] = {"type": qtype, "active": True, "index": 0, "questions": qs}
-    return qs[0]
+# --- 数→漢数字（価格読み用） ---
+_DIG = "零一二三四五六七八九"
+_UNIT1 = ["", "十", "百", "千"]
+_UNIT4 = ["", "万", "億", "兆"]
 
-def get_next_question(chat_id):
-    state = quiz_state.get(chat_id)
-    if not state: return None
-    state["index"] += 1
-    if state["index"] >= len(state["questions"]):
-        quiz_state[chat_id]["active"] = False
-        return None
-    return state["questions"][state["index"]]
+def _four_digits_to_kanji(n: int) -> str:
+    s = ""
+    for i, u in enumerate(_UNIT1[::-1]):
+        d = (n // (10 ** (3 - i))) % 10
+        if d == 0:
+            continue
+        s += ("" if (u and d == 1) else _DIG[d]) + u
+    return s or _DIG[0]
 
-def format_question(q):
-    return f"問題: {q['sentence']}\n{q['choices']}"
+def num_to_kanji(num: int) -> str:
+    if num == 0:
+        return _DIG[0]
+    parts = []
+    i = 0
+    while num > 0 and i < len(_UNIT4):
+        n = num % 10000
+        if n:
+            parts.append(_four_digits_to_kanji(n) + _UNIT4[i])
+        num //= 10000
+        i += 1
+    return "".join(reversed(parts)) or _DIG[0]
 
-def check_answer(chat_id, user_ans):
-    state = quiz_state.get(chat_id)
-    if not state: return None, None
-    q = state["questions"][state["index"]]
-    correct = q["answer"].strip()
-    explanation = q.get("explanation_vi", "")
+_price_patterns = [
+    re.compile(r"(¥)\s*(\d{1,3}(?:,\d{3})+|\d+)"),
+    re.compile(r"(\d{1,3}(?:,\d{3})+|\d+)\s*円"),
+    re.compile(r"(?:VND|vnd)\s*(\d{1,3}(?:[.,]\d{3})+|\d+)"),
+    re.compile(r"(\d{1,3}(?:[.,]\d{3})+|\d+)\s*(?:VND|vnd)"),
+    re.compile(r"[₫đ]\s*(\d{1,3}(?:[.,]\d{3})+|\d+)"),
+    re.compile(r"(\d{1,3}(?:[.,]\d{3})+|\d+)\s*[₫đ]"),
+]
 
-    if user_ans == correct:
-        result = f"⭕ 正解！ {q['choices'].split(';')[int(correct)-1]} {explanation}"
-    else:
-        result = f"❌ 不正解。正解は {correct}) {q['choices'].split(';')[int(correct)-1]}"
+def _digits_to_int(s: str) -> int:
+    return int(re.sub(r"[^\d]", "", s))
 
-    nq = get_next_question(chat_id)
-    return result, nq
+def convert_prices_to_kanji(text: str) -> str:
+    def yen_symbol_sub(m): return f"{num_to_kanji(_digits_to_int(m.group(2)))}円"
+    def yen_after_sub(m):  return f"{num_to_kanji(_digits_to_int(m.group(1)))}円"
+    def vnd_prefix_sub(m): return f"{num_to_kanji(_digits_to_int(m.group(1)))}ドン"
+    def vnd_after_sub(m):  return f"{num_to_kanji(_digits_to_int(m.group(1)))}ドン"
+    def dong_prefix(m):    return f"{num_to_kanji(_digits_to_int(m.group(1)))}ドン"
+    def dong_after(m):     return f"{num_to_kanji(_digits_to_int(m.group(1)))}ドン"
+    text = _price_patterns[0].sub(yen_symbol_sub, text)
+    text = _price_patterns[1].sub(yen_after_sub, text)
+    text = _price_patterns[2].sub(vnd_prefix_sub, text)
+    text = _price_patterns[3].sub(vnd_after_sub, text)
+    text = _price_patterns[4].sub(dong_prefix, text)
+    text = _price_patterns[5].sub(dong_after, text)
+    return text
+
+# --- ひらがな化（単語ごとスペース区切り） ---
+def to_hiragana(text: str, spaced: bool = False) -> str:
+    text = convert_prices_to_kanji(text)
+    tokens = _sudachi.tokenize(text, _SPLIT)
+    words = []
+    for t in tokens:
+        pos0 = t.part_of_speech()[0]
+        surf = t.surface()
+
+        # 記号／補助記号はそのまま（「きごう」化を防ぐ）
+        if pos0 in ["記号", "補助記号", "未知語"]:
+            words.append(surf)
+            continue
+        # 英数はそのまま
+        if re.fullmatch(r"[0-9A-Za-z]+", surf):
+            words.append(surf)
+            continue
+
+        yomi = t.reading_form()
+        hira = surf if yomi == "*" else yomi.translate(_katakana_to_hira)
+        words.append(hira)
+
+    return " ".join(words) if spaced else "".join(words)
+
+# --- ローマ字（単語ごとスペース区切り） ---
+def to_romaji(text: str, spaced: bool = False) -> str:
+    hira = to_hiragana(text, spaced=True)
+    parts = [p for p in hira.split(" ") if p]
+    roma_parts = [_converter_roma.do(p) for p in parts]
+    return " ".join(roma_parts) if spaced else "".join(roma_parts)
+
+# ====== LINE 返信 ======
+def reply_message(reply_token: str, text: str):
+    headers = {"Content-Type": "application/json",
+               "Authorization": f"Bearer {LINE_CHANNEL_ACCESS_TOKEN}"}
+    body = {"replyToken": reply_token, "messages": [{"type": "text", "text": text[:4900]}]}
+    requests.post("https://api.line.me/v2/bot/message/reply",
+                  headers=headers, data=json.dumps(body), timeout=15)
+
+# ====== 状態管理（チャット単位で表示ON/OFF） ======
+state = {}
+DEFAULTS = {"show_hira": True, "show_romaji": True}
+
+def get_state(chat_id: str):
+    if chat_id not in state:
+        state[chat_id] = DEFAULTS.copy()
+    return state[chat_id]
+
+def set_state(chat_id: str, **kwargs):
+    s = get_state(chat_id)
+    s.update({k: v for k, v in kwargs.items() if k in s})
+    state[chat_id] = s
+    return s
+
+def parse_command(text: str):
+    t = text.strip().lower()
+    if t == "/status": return ("status", None)
+    m = re.match(r"^/(hira|h)\s+(on|off)$", t)
+    if m: return ("hira", m.group(2) == "on")
+    m = re.match(r"^/(romaji|r)\s+(on|off)$", t)
+    if m: return ("romaji", m.group(2) == "on")
+    return (None, None)
+
+# ====== ルート ======
+@app.route("/", methods=["GET"])
+def health():
+    return "ok", 200
+
+TAG_PREFIX_RE = re.compile(r'^\[\s*(?:JP|VN|JA|VI)\s*[\-→]\s*(?:JP|VN|JA|VI)\s*\]\s*',
+                           re.IGNORECASE)
 
 # ====== Webhook ======
 @app.route("/webhook", methods=["POST"])
 def webhook():
     signature = request.headers.get("X-Line-Signature")
     body = request.get_data() or b""
+    if (not signature) and (not body):
+        return "OK", 200
     if not signature or not verify_signature(body, signature):
         return "bad signature", 400
 
@@ -105,45 +190,53 @@ def webhook():
     events = data.get("events", [])
 
     for ev in events:
-        if ev.get("type") != "message": continue
+        if ev.get("type") != "message":
+            continue
         msg = ev.get("message", {})
-        if msg.get("type") != "text": continue
+        if msg.get("type") != "text":
+            continue
 
-        text = (msg.get("text") or "").strip()
+        # [JP→VN] 等のタグを外す
+        text = TAG_PREFIX_RE.sub("", msg.get("text") or "", count=1)
+
+        # チャットID（個チャ/グループ共通）
         src = ev.get("source", {})
         chat_id = src.get("groupId") or src.get("roomId") or src.get("userId")
 
-        # ===== クイズ回答処理 =====
-        if chat_id in quiz_state and quiz_state[chat_id]["active"]:
-            if text in ["1", "2", "3", "4"]:
-                result, nq = check_answer(chat_id, text)
-                if nq:
-                    reply_message(ev["replyToken"], [result, format_question(nq)])
-                else:
-                    reply_message(ev["replyToken"], [result, "✅ N5クイズを終了しました。おつかれさま！"])
-                continue  # 翻訳しない
+        # コマンド
+        cmd, val = parse_command(text)
+        if cmd == "hira":
+            set_state(chat_id, show_hira=val)
+            reply_message(ev["replyToken"], f"ひらがな表示を {'ON' if val else 'OFF'} にしました。")
+            continue
+        if cmd == "romaji":
+            set_state(chat_id, show_romaji=val)
+            reply_message(ev["replyToken"], f"ローマ字表示を {'ON' if val else 'OFF'} にしました。")
+            continue
+        if cmd == "status":
+            s = get_state(chat_id)
+            reply_message(ev["replyToken"],
+                          f"現在の設定\n- ひらがな: {'ON' if s['show_hira'] else 'OFF'}"
+                          f"\n- ローマ字: {'ON' if s['show_romaji'] else 'OFF'}")
+            continue
 
-        # ===== コマンド処理 =====
-        if text.startswith("/quiz "):
-            cmd = text.split(" ", 1)[1]
-            if cmd in ["grammar", "meaning", "reading"]:
-                q = start_quiz(chat_id, cmd)
-                if q:
-                    reply_message(ev["replyToken"], [format_question(q)])
-                else:
-                    reply_message(ev["replyToken"], [f"{cmd}の問題がありません。"])
-                continue
-            elif cmd == "stop":
-                quiz_state[chat_id] = {"active": False}
-                reply_message(ev["replyToken"], ["✅ N5クイズを終了しました。おつかれさま！"])
-                continue
-
-        # ===== 翻訳処理 =====
+        # 翻訳
         src_lang, translated = guess_and_translate(text)
+        s = get_state(chat_id)
+
+        lines = []
         if src_lang == "VI":
-            reply_message(ev["replyToken"], [f"[VN→JP]\n{translated}"])
+            lines.append("[VN→JP]")
+            lines.append(translated)
+            if s["show_hira"]:
+                lines.append(f"\n(ひらがな) {to_hiragana(translated, spaced=True)}")
+            if s["show_romaji"]:
+                lines.append(f"(romaji) {to_romaji(translated, spaced=True)}")
         else:
-            reply_message(ev["replyToken"], [f"[JP→VN]\n{translated}"])
+            lines.append("[JP→VN]")
+            lines.append(translated)
+
+        reply_message(ev["replyToken"], "\n".join(lines))
 
     return "OK", 200
 
