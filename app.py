@@ -4,6 +4,7 @@ from flask import Flask, request
 # ====== 環境変数 ======
 LINE_CHANNEL_SECRET = os.environ["LINE_CHANNEL_SECRET"]
 LINE_CHANNEL_ACCESS_TOKEN = os.environ["LINE_CHANNEL_ACCESS_TOKEN"]
+DEEPL_API_KEY = os.environ["DEEPL_API_KEY"]
 
 app = Flask(__name__)
 
@@ -14,13 +15,31 @@ def verify_signature(body: bytes, signature: str) -> bool:
     return hmac.compare_digest(expected, signature)
 
 # ====== LINE返信 ======
-def reply_message(reply_token: str, text: str):
+def reply_message(reply_token: str, texts: list[str]):
     headers = {"Content-Type": "application/json",
                "Authorization": f"Bearer {LINE_CHANNEL_ACCESS_TOKEN}"}
     body = {"replyToken": reply_token,
-            "messages": [{"type": "text", "text": text[:4900]}]}
+            "messages": [{"type": "text", "text": t[:4900]} for t in texts]}
     requests.post("https://api.line.me/v2/bot/message/reply",
                   headers=headers, data=json.dumps(body), timeout=15)
+
+# ====== DeepL 翻訳 ======
+def deepl_translate(text: str, target_lang: str) -> str:
+    url = "https://api-free.deepl.com/v2/translate"
+    data = {"auth_key": DEEPL_API_KEY, "text": text, "target_lang": target_lang}
+    r = requests.post(url, data=data, timeout=15)
+    r.raise_for_status()
+    return r.json()["translations"][0]["text"]
+
+# ====== 言語判定 ======
+def guess_and_translate(text: str):
+    vi_chars = set("ăâđêôơưÀÁẢÃẠĂẰẮẲẴẶÂẦẤẨẪẬĐÈÉẺẼẸÊ..."
+                   "ỳýỷỹỵ")  # 短縮
+    is_vi = any(c in vi_chars for c in text.lower())
+    if is_vi:
+        return "VI", deepl_translate(text, "JA")
+    else:
+        return "JA", deepl_translate(text, "VI")
 
 # ====== クイズデータ読込 ======
 QUIZ_FILES = {
@@ -29,7 +48,6 @@ QUIZ_FILES = {
     "reading": "data/Reading.csv"
 }
 quizzes = {}
-
 for qtype, path in QUIZ_FILES.items():
     try:
         with open(path, encoding="utf-8") as f:
@@ -68,7 +86,7 @@ def check_answer(chat_id, user_ans):
     explanation = q.get("explanation_vi", "")
 
     if user_ans == correct:
-        result = f"⭕ 正解！ 「{q['choices'].split(';')[int(correct)-1]}」 {explanation}"
+        result = f"⭕ 正解！ {q['choices'].split(';')[int(correct)-1]} {explanation}"
     else:
         result = f"❌ 不正解。正解は {correct}) {q['choices'].split(';')[int(correct)-1]}"
 
@@ -99,10 +117,11 @@ def webhook():
         if chat_id in quiz_state and quiz_state[chat_id]["active"]:
             if text in ["1", "2", "3", "4"]:
                 result, nq = check_answer(chat_id, text)
-                if result: reply_message(ev["replyToken"], result)
-                if nq: reply_message(ev["replyToken"], format_question(nq))
-                else: reply_message(ev["replyToken"], "✅ N5クイズを終了しました。おつかれさま！")
-                continue  # ← 翻訳処理に行かないようにする！
+                if nq:
+                    reply_message(ev["replyToken"], [result, format_question(nq)])
+                else:
+                    reply_message(ev["replyToken"], [result, "✅ N5クイズを終了しました。おつかれさま！"])
+                continue  # 翻訳しない
 
         # ===== コマンド処理 =====
         if text.startswith("/quiz "):
@@ -110,17 +129,21 @@ def webhook():
             if cmd in ["grammar", "meaning", "reading"]:
                 q = start_quiz(chat_id, cmd)
                 if q:
-                    reply_message(ev["replyToken"], format_question(q))
+                    reply_message(ev["replyToken"], [format_question(q)])
                 else:
-                    reply_message(ev["replyToken"], f"{cmd}の問題がありません。")
+                    reply_message(ev["replyToken"], [f"{cmd}の問題がありません。"])
                 continue
             elif cmd == "stop":
                 quiz_state[chat_id] = {"active": False}
-                reply_message(ev["replyToken"], "✅ N5クイズを終了しました。おつかれさま！")
+                reply_message(ev["replyToken"], ["✅ N5クイズを終了しました。おつかれさま！"])
                 continue
 
-        # ===== 翻訳処理（省略可：前の翻訳コードをここに入れる） =====
-        reply_message(ev["replyToken"], "[JP⇔VN 翻訳処理はここに実装]")
+        # ===== 翻訳処理 =====
+        src_lang, translated = guess_and_translate(text)
+        if src_lang == "VI":
+            reply_message(ev["replyToken"], [f"[VN→JP]\n{translated}"])
+        else:
+            reply_message(ev["replyToken"], [f"[JP→VN]\n{translated}"])
 
     return "OK", 200
 
