@@ -42,29 +42,107 @@ def guess_and_translate(text: str):
         return "JA", deepl_translate(text, "VI")  # JA → VI
 
 # ====== かな/ローマ字変換 ======
-# ローマ字は pykakasi
-_kakasi_roma = kakasi()
-_kakasi_roma.setMode("J", "a"); _kakasi_roma.setMode("K", "a"); _kakasi_roma.setMode("H", "a")
-_converter_roma = _kakasi_roma.getConverter()
-def to_romaji(text: str) -> str:
-    return _converter_roma.do(text)
-
-# ひらがなは Sudachi（文脈で読みを出す）
+# ひらがなは Sudachi（文脈で読み）＋ 記号/絵文字そのまま ＋ 価格だけ数→漢数字
 _sudachi = dictionary.Dictionary().create()
 _SPLIT = sudachi_tokenizer.Tokenizer.SplitMode.C
 _katakana_to_hira = str.maketrans({chr(k): chr(k - 0x60) for k in range(ord("ァ"), ord("ヶ") + 1)})
 
+# --- 数→漢数字ユーティリティ ---
+_DIG = "零一二三四五六七八九"
+_UNIT1 = ["", "十", "百", "千"]
+_UNIT4 = ["", "万", "億", "兆"]
+
+def _four_digits_to_kanji(n: int) -> str:
+    assert 0 <= n <= 9999
+    s = ""
+    for i, u in enumerate(_UNIT1[::-1]):  # 千百十一
+        d = (n // (10 ** (3 - i))) % 10
+        if d == 0: continue
+        s += ("" if (u and d == 1) else _DIG[d]) + u
+    return s or _DIG[0]
+
+def num_to_kanji(num: int) -> str:
+    if num == 0: return _DIG[0]
+    parts, i = [], 0
+    while num > 0 and i < len(_UNIT4):
+        n = num % 10000
+        if n:
+            head = _four_digits_to_kanji(n)
+            if head != _DIG[0]:
+                parts.append(head + _UNIT4[i])
+        num //= 10000; i += 1
+    return "".join(reversed(parts)) or _DIG[0]
+
+# --- 価格だけ（円/ドン/VND）数値→漢数字にする ---
+_price_patterns = [
+    re.compile(r"(¥)\s*(\d{1,3}(?:,\d{3})+|\d+)"),
+    re.compile(r"(\d{1,3}(?:,\d{3})+|\d+)\s*円"),
+    re.compile(r"(?:VND|vnd)\s*(\d{1,3}(?:[.,]\d{3})+|\d+)"),
+    re.compile(r"(\d{1,3}(?:[.,]\d{3})+|\d+)\s*(?:VND|vnd)"),
+    re.compile(r"[₫đ]\s*(\d{1,3}(?:[.,]\d{3})+|\d+)"),
+    re.compile(r"(\d{1,3}(?:[.,]\d{3})+|\d+)\s*[₫đ]"),
+]
+
+def _digits_to_int(s: str) -> int:
+    return int(re.sub(r"[^\d]", "", s))
+
+def convert_prices_to_kanji(text: str) -> str:
+    def yen_symbol_sub(m):
+        num_kanji = num_to_kanji(_digits_to_int(m.group(2)))
+        return f"{num_kanji}円"
+    def yen_after_sub(m):
+        num_kanji = num_to_kanji(_digits_to_int(m.group(1)))
+        return f"{num_kanji}円"
+    def vnd_prefix_sub(m):
+        num_kanji = num_to_kanji(_digits_to_int(m.group(1)))
+        return f"{num_kanji}ドン"
+    def vnd_after_sub(m):
+        num_kanji = num_to_kanji(_digits_to_int(m.group(1)))
+        return f"{num_kanji}ドン"
+    def dong_prefix(m):
+        num_kanji = num_to_kanji(_digits_to_int(m.group(1)))
+        return f"{num_kanji}ドン"
+    def dong_after(m):
+        num_kanji = num_to_kanji(_digits_to_int(m.group(1)))
+        return f"{num_kanji}ドン"
+
+    text = _price_patterns[0].sub(yen_symbol_sub, text)
+    text = _price_patterns[1].sub(yen_after_sub, text)
+    text = _price_patterns[2].sub(vnd_prefix_sub, text)
+    text = _price_patterns[3].sub(vnd_after_sub, text)
+    text = _price_patterns[4].sub(dong_prefix, text)
+    text = _price_patterns[5].sub(dong_after, text)
+    return text
+
 def to_hiragana(text: str) -> str:
+    # 1) 価格だけ漢数字化（電話番号などの数字は触らない）
+    text = convert_prices_to_kanji(text)
+
+    # 2) Sudachiで文脈読みを取得。記号・絵文字・英数はそのまま残す
     tokens = _sudachi.tokenize(text, _SPLIT)
-    katakana = "".join(t.reading_form() if t.reading_form() != "*" else t.surface() for t in tokens)
-    return katakana.translate(_katakana_to_hira)
+    result = []
+    for t in tokens:
+        pos0 = t.part_of_speech()[0]
+        surf = t.surface()
+        if pos0 in ["記号", "補助記号", "未知語"] or surf.isalnum():
+            result.append(surf)
+            continue
+        yomi = t.reading_form()
+        result.append((surf if yomi == "*" else yomi.translate(_katakana_to_hira)))
+    return "".join(result)
+
+# --- ローマ字は「ひらがな化 → ローマ字」に一本化（誤読防止） ---
+_kakasi_roma = kakasi()
+_kakasi_roma.setMode("H", "a")  # ひらがな→ローマ字
+_converter_roma = _kakasi_roma.getConverter()
+
+def to_romaji(text: str) -> str:
+    hira = to_hiragana(text)
+    return _converter_roma.do(hira)
 
 # ====== LINE 返信 ======
 def reply_message(reply_token: str, text: str):
-    headers = {
-        "Content-Type": "application/json",
-        "Authorization": f"Bearer {LINE_CHANNEL_ACCESS_TOKEN}",
-    }
+    headers = {"Content-Type": "application/json", "Authorization": f"Bearer {LINE_CHANNEL_ACCESS_TOKEN}"}
     body = {"replyToken": reply_token, "messages": [{"type": "text", "text": text[:4900]}]}
     requests.post("https://api.line.me/v2/bot/message/reply", headers=headers, data=json.dumps(body), timeout=15)
 
@@ -94,13 +172,13 @@ def parse_command(text: str):
 def health():
     return "ok", 200
 
-# ====== Webhook ======
-# 先頭の方向タグを除去するための正規表現（JP/VN と JA/VI の旧表記も対応）
+# ====== 方向タグ除去（先頭の [JP→VN]/[VN→JP] と旧 [JA→VI]/[VI→JA] を剥がす） ======
 TAG_PREFIX_RE = re.compile(
     r'^\[\s*(?:JP|VN|JA|VI)\s*[\-→]\s*(?:JP|VN|JA|VI)\s*\]\s*',
     flags=re.IGNORECASE
 )
 
+# ====== Webhook ======
 @app.route("/webhook", methods=["POST"])
 def webhook():
     signature = request.headers.get("X-Line-Signature")
@@ -118,7 +196,8 @@ def webhook():
 
     for ev in events:
         etype = ev.get("type")
-        # グループ招待などの非メッセージイベントは無視（必要なら返信してもOK）
+
+        # グループ招待などの非メッセージイベントは無視
         if etype == "join":
             # reply_message(ev["replyToken"], "招待ありがとう！JP⇔VN翻訳を始めます。")
             continue
@@ -130,15 +209,13 @@ def webhook():
             continue
 
         text = (msg.get("text") or "").strip()
-
-        # 先頭に [JP→VN] / [VN→JP] / [JA→VI] / [VI→JA] が付いていたら剥がす
-        text = TAG_PREFIX_RE.sub("", text, count=1)
+        text = TAG_PREFIX_RE.sub("", text, count=1)  # 先頭の方向タグを剥がす
 
         # チャットID（個人/グループ/ルーム）
         src = ev.get("source", {})
         chat_id = src.get("groupId") or src.get("roomId") or src.get("userId")
 
-        # コマンド対応（/hira, /romaji, /status）
+        # コマンド（/hira, /romaji, /status）
         cmd, val = parse_command(text)
         if cmd == "hira":
             set_state(chat_id, show_hira=val)
