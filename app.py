@@ -1,4 +1,4 @@
-# app.py  ← このファイルの中身を丸ごと置き換えてください
+# app.py
 import os, hmac, hashlib, base64, json, requests, re
 from flask import Flask, request, abort
 from pykakasi import kakasi
@@ -37,11 +37,11 @@ def guess_and_translate(text: str):
                    "ỳýỷỹỵ")
     is_vi = any(c in vi_chars for c in text.lower())
     if is_vi:
-        return "VI", deepl_translate(text, "JA")
+        return "VI", deepl_translate(text, "JA")  # VI → JA
     else:
-        return "JA", deepl_translate(text, "VI")
+        return "JA", deepl_translate(text, "VI")  # JA → VI
 
-# ====== かな/ローマ字変換器（使い回し） ======
+# ====== かな/ローマ字変換器 ======
 _kakasi_hira = kakasi(); _kakasi_hira.setMode("J","H"); _kakasi_hira.setMode("K","H"); _kakasi_hira.setMode("H","H")
 _converter_hira = _kakasi_hira.getConverter()
 _kakasi_roma = kakasi(); _kakasi_roma.setMode("J","a"); _kakasi_roma.setMode("K","a"); _kakasi_roma.setMode("H","a")
@@ -83,22 +83,21 @@ def parse_command(text: str):
         return ("romaji", m.group(2) == "on")
     return (None, None)
 
-# ====== ヘルスチェック（任意） ======
+# ====== ヘルスチェック ======
 @app.route("/", methods=["GET"])
 def health():
     return "ok", 200
 
-# ====== Webhook（ここが肝） ======
+# ====== Webhook ======
 @app.route("/webhook", methods=["POST"])
 def webhook():
     signature = request.headers.get("X-Line-Signature")
     body = request.get_data() or b""
 
-    # Verifyボタン等で空POSTが来ることがある → 200で返す
+    # Verifyボタン用：空POSTならOK返す
     if (not signature) and (not body):
         return "OK", 200
 
-    # 署名検証（署名無し/不一致は400で応答）
     if not signature or not verify_signature(body, signature):
         return "bad signature", 400
 
@@ -115,10 +114,9 @@ def webhook():
         text = msg.get("text", "")
 
         # 自分の出力は再翻訳しない
-        if text.startswith("[VI→JA]") or text.startswith("[JA→VI]"):
+        if text.startswith("[VN→JP]") or text.startswith("[JP→VN]"):
             continue
 
-        # チャットID（個人/グループ/ルーム）
         src_info = ev.get("source", {})
         chat_id = src_info.get("groupId") or src_info.get("roomId") or src_info.get("userId")
 
@@ -137,26 +135,25 @@ def webhook():
             reply_message(ev["replyToken"], f"現在の設定\n- ひらがな: {'ON' if s['show_hira'] else 'OFF'}\n- ローマ字: {'ON' if s['show_romaji'] else 'OFF'}")
             continue
 
-        # 翻訳（必須）
+        # 翻訳
         src_lang, translated = guess_and_translate(text)
 
-        # 出力組み立て
+        # 出力
         s = get_state(chat_id)
         lines = []
         if src_lang == "VI":
-            lines.append("[VI→JA]")
+            lines.append("[VN→JP]")   # 表示をJP/VNに修正
             lines.append(translated)
             if s["show_hira"]:
                 lines.append(f"\n(ひらがな) {to_hiragana(translated)}")
             if s["show_romaji"]:
                 lines.append(f"(romaji) {to_romaji(translated)}")
         else:
-            lines.append("[JA→VI]")
+            lines.append("[JP→VN]")
             lines.append(translated)
 
         reply_message(ev["replyToken"], "\n".join(lines))
 
-    # イベントが0件でも必ず 200 を返す
     return "OK", 200
 
 # ====== ローカル実行用 ======
