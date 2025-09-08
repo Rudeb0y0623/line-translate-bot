@@ -1,10 +1,7 @@
-# app.py
 import os, hmac, hashlib, base64, json, requests, re
 from flask import Flask, request
-
-# 日本語→読み/ローマ字
-from sudachipy import dictionary, tokenizer as sudachi_tokenizer
 from pykakasi import kakasi
+from sudachipy import dictionary, tokenizer as sudachi_tokenizer
 
 # ========= 環境変数 =========
 LINE_CHANNEL_SECRET = os.environ["LINE_CHANNEL_SECRET"]
@@ -17,7 +14,7 @@ app = Flask(__name__)
 def verify_signature(body: bytes, signature: str) -> bool:
     mac = hmac.new(LINE_CHANNEL_SECRET.encode("utf-8"), body, hashlib.sha256).digest()
     expected = base64.b64encode(mac).decode("utf-8")
-    return hmac.compare_digest(expected, signature)
+    return hmac.compare_digest(expected, signature or "")
 
 # ========= DeepL 翻訳 =========
 def deepl_translate(text: str, target_lang: str) -> str:
@@ -27,7 +24,7 @@ def deepl_translate(text: str, target_lang: str) -> str:
     r.raise_for_status()
     return r.json()["translations"][0]["text"]
 
-# ========= 言語推定（簡易）→ 翻訳 =========
+# ========= 言語判定（超簡易）→ 翻訳 =========
 VI_CHARS = set(
     "ăâđêôơưÀÁẢÃẠĂẰẮẲẴẶÂẦẤẨẪẬĐÈÉẺẼẸÊỀẾỂỄỆ"
     "ÌÍỈĨỊÒÓỎÕỌÔỒỐỔỖỘƠỜỚỞỠỢ"
@@ -42,70 +39,122 @@ VI_CHARS = set(
 def guess_and_translate(text: str):
     is_vi = any(c in VI_CHARS for c in text)
     if is_vi:
-        return "VI", deepl_translate(text, "JA")     # VI → JA
+        return "VI", deepl_translate(text, "JA")   # VI → JA
     else:
-        return "JA", deepl_translate(text, "VI")     # JA → VI
+        return "JA", deepl_translate(text, "VI")   # JA → VI
 
-# ========= かな/ローマ字変換 =========
+# ========= 形態素・かな/ローマ字変換 =========
 _sudachi = dictionary.Dictionary().create()
 _SPLIT = sudachi_tokenizer.Tokenizer.SplitMode.C
-# カタカナ→ひらがな
 _katakana_to_hira = str.maketrans({chr(k): chr(k - 0x60) for k in range(ord("ァ"), ord("ヶ") + 1)})
 
-# pykakasi（ローマ字）
-_kakasi = kakasi()
-_kakasi.setMode("H", "a")   # ひらがな→ローマ字
-_kakasi.setMode("K", "a")   # カタカナ→ローマ字
-_kakasi.setMode("J", "a")   # 漢字→ローマ字
-_romaji_conv = _kakasi.getConverter()
+# pykakasi（かな/カナ/漢字→ローマ字）
+_kakasi_roma = kakasi()
+_kakasi_roma.setMode("H", "a")  # Hiragana -> roman
+_kakasi_roma.setMode("K", "a")  # Katakana -> roman
+_kakasi_roma.setMode("J", "a")  # Kanji -> roman
+_romaji_conv = _kakasi_roma.getConverter()
 
-def _tokenize_to_hiragana_tokens(text: str):
-    """
-    Sudachi で分かち書き。記号・空白は「そのまま残す」＝『記号』という文字列は挿入しない。
-    """
+# --- 数→漢数字（価格用） ---
+_DIG = "零一二三四五六七八九"
+_UNIT1 = ["", "十", "百", "千"]
+_UNIT4 = ["", "万", "億", "兆"]
+
+def _four_digits_to_kanji(n: int) -> str:
+    s = ""
+    for i, u in enumerate(_UNIT1[::-1]):  # 千百十一
+        d = (n // (10 ** (3 - i))) % 10
+        if d == 0:
+            continue
+        s += ("" if (u and d == 1) else _DIG[d]) + u
+    return s or _DIG[0]
+
+def num_to_kanji(num: int) -> str:
+    if num == 0:
+        return _DIG[0]
+    parts = []
+    i = 0
+    while num > 0 and i < len(_UNIT4):
+        n = num % 10000
+        if n:
+            parts.append(_four_digits_to_kanji(n) + _UNIT4[i])
+        num //= 10000
+        i += 1
+    return "".join(reversed(parts)) or _DIG[0]
+
+# 価格（円/ドン/VND）のみ漢数字化
+_price_patterns = [
+    re.compile(r"(¥)\s*(\d{1,3}(?:,\d{3})+|\d+)"),
+    re.compile(r"(\d{1,3}(?:,\d{3})+|\d+)\s*円"),
+    re.compile(r"(?:VND|vnd)\s*(\d{1,3}(?:[.,]\d{3})+|\d+)"),
+    re.compile(r"(\d{1,3}(?:[.,]\d{3})+|\d+)\s*(?:VND|vnd)"),
+    re.compile(r"[₫đ]\s*(\d{1,3}(?:[.,]\d{3})+|\d+)"),
+    re.compile(r"(\d{1,3}(?:[.,]\d{3})+|\d+)\s*[₫đ]"),
+]
+def _digits_to_int(s: str) -> int:
+    return int(re.sub(r"[^\d]", "", s))
+
+def convert_prices_to_kanji(text: str) -> str:
+    def yen_symbol_sub(m): return f"{num_to_kanji(_digits_to_int(m.group(2)))}円"
+    def yen_after_sub(m):  return f"{num_to_kanji(_digits_to_int(m.group(1)))}円"
+    def vnd_prefix(m):    return f"{num_to_kanji(_digits_to_int(m.group(1)))}ドン"
+    def vnd_after(m):     return f"{num_to_kanji(_digits_to_int(m.group(1)))}ドン"
+    text = _price_patterns[0].sub(yen_symbol_sub, text)
+    text = _price_patterns[1].sub(yen_after_sub, text)
+    text = _price_patterns[2].sub(vnd_prefix, text)
+    text = _price_patterns[3].sub(vnd_after, text)
+    text = _price_patterns[4].sub(vnd_prefix, text)
+    text = _price_patterns[5].sub(vnd_after, text)
+    return text
+
+# かな化（記号・空白はそのまま。spaced=True で語間スペース）
+def to_hiragana(text: str, spaced: bool = False) -> str:
+    text = convert_prices_to_kanji(text)
     tokens = _sudachi.tokenize(text, _SPLIT)
-    result = []
+    parts = []
     for t in tokens:
-        pos0 = t.part_of_speech()[0]   # 品詞大分類
+        pos0 = t.part_of_speech()[0]
         surf = t.surface()
 
-        # 数字・英字はそのまま
-        if re.fullmatch(r"[0-9A-Za-z]+", surf):
-            result.append(surf)
-            continue
-
-        # 記号・補助記号・空白はそのまま（← ここで『記号』という語を入れない）
-        if pos0 in ("記号", "補助記号"):
-            result.append(surf)
+        # 記号・未知語・英数はそのまま
+        if pos0 in ["記号", "補助記号", "空白", "未知語"] or re.fullmatch(r"[0-9A-Za-z]+", surf):
+            parts.append(surf)
             continue
 
         yomi = t.reading_form()
-        hira = surf if (yomi == "*" or not yomi) else yomi.translate(_katakana_to_hira)
-        result.append(hira)
-    return result
+        hira = surf if yomi == "*" else yomi.translate(_katakana_to_hira)
+        parts.append(hira)
 
-def to_hiragana(text: str, spaced: bool = False) -> str:
-    parts = _tokenize_to_hiragana_tokens(text)
-    if spaced:
-        # 全角スペースは半角に統一
-        return " ".join(parts).replace("　", " ")
-    return "".join(parts).replace("　", " ")
+    return " ".join(parts) if spaced else "".join(parts)
 
+# 👉 記号が "kigou" にならないローマ字変換
+#    かな/漢字だけをローマ字化し、記号・空白・数字・英字はそのまま残す
+_JP_WORD_RE = re.compile(r'^[\u3040-\u30ff\u3400-\u9fff\u3005\u30fc]+$')  # 々・ー を含む
 def to_romaji(text: str, spaced: bool = False) -> str:
-    # ひらがなトークン列をベースにローマ字化（スペースはそのまま）
     hira = to_hiragana(text, spaced=True)
-    roma = " ".join(_romaji_conv.do(p) for p in hira.split(" "))
+    out = []
+    for tok in hira.split(" "):
+        if not tok:
+            out.append("")
+            continue
+        if _JP_WORD_RE.fullmatch(tok):
+            out.append(_romaji_conv.do(tok))
+        else:
+            out.append(tok)  # 記号・空白・数字・英字はそのまま
+    roma = " ".join(out)
     return roma if spaced else roma.replace(" ", "")
 
 # ========= LINE 返信 =========
 def reply_message(reply_token: str, text: str):
-    headers = {"Content-Type": "application/json",
-               "Authorization": f"Bearer {LINE_CHANNEL_ACCESS_TOKEN}"}
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {LINE_CHANNEL_ACCESS_TOKEN}",
+    }
     body = {"replyToken": reply_token, "messages": [{"type": "text", "text": text[:4900]}]}
     requests.post("https://api.line.me/v2/bot/message/reply",
                   headers=headers, data=json.dumps(body), timeout=15)
 
-# ========= 状態管理（ひらがな/ローマ字の独立ON/OFF） =========
+# ========= 状態管理 =========
 state = {}
 DEFAULTS = {"show_hira": True, "show_romaji": True}
 
@@ -116,36 +165,25 @@ def get_state(chat_id: str):
 
 def set_state(chat_id: str, **kwargs):
     s = get_state(chat_id)
-    for k, v in kwargs.items():
-        if k in s and isinstance(v, bool):
-            s[k] = v
+    s.update({k: v for k, v in kwargs.items() if k in s})
     state[chat_id] = s
     return s
 
-# コマンド解析：スペース区切りで複数コマンド同時可（/h on /r off など）
-def parse_commands(text: str):
-    tokens = text.strip().split()
-    cmds = []
-    i = 0
-    while i < len(tokens):
-        t = tokens[i].lower()
-        if t in ("/hira", "/h", "/romaji", "/r"):
-            # 次トークンが on/off なら取得
-            val = None
-            if i + 1 < len(tokens) and tokens[i+1].lower() in ("on", "off"):
-                val = (tokens[i+1].lower() == "on")
-                i += 1
-            cmds.append((t[1], val))  # 'h' or 'r'
-        elif t == "/status":
-            cmds.append(("status", None))
-        i += 1
-    return cmds
+def parse_command(text: str):
+    t = text.strip().lower()
+    if t == "/status": return ("status", None)
+    m = re.match(r"^/(hira|h)\s+(on|off)$", t)
+    if m: return ("hira", m.group(2) == "on")
+    m = re.match(r"^/(romaji|r)\s+(on|off)$", t)
+    if m: return ("romaji", m.group(2) == "on")
+    return (None, None)
 
 # ========= ルート =========
 @app.route("/", methods=["GET"])
 def health():
     return "ok", 200
 
+# ユーザーが頭に付ける [JP→VN] / [VN→JP] を除去
 TAG_PREFIX_RE = re.compile(r'^\[\s*(?:JP|JA|VN|VI)\s*[\-→]\s*(?:JP|JA|VN|VI)\s*\]\s*', re.IGNORECASE)
 
 # ========= Webhook =========
@@ -155,66 +193,47 @@ def webhook():
     body = request.get_data() or b""
     if (not signature) and (not body):
         return "OK", 200
-    if not signature or not verify_signature(body, signature):
+    if not verify_signature(body, signature):
         return "bad signature", 400
 
     data = request.get_json(silent=True) or {}
-    events = data.get("events", [])
-
-    for ev in events:
-        if ev.get("type") != "message": 
+    for ev in data.get("events", []):
+        if ev.get("type") != "message":
             continue
         msg = ev.get("message", {})
-        if msg.get("type") != "text": 
+        if msg.get("type") != "text":
             continue
 
-        # タグ [JP→VN] 等を先頭から除去
         text = TAG_PREFIX_RE.sub("", msg.get("text") or "", count=1)
 
+        # チャット単位の設定
         src = ev.get("source", {})
         chat_id = src.get("groupId") or src.get("roomId") or src.get("userId")
-        s = get_state(chat_id)
 
-        # ----- コマンド処理（複数可）-----
-        executed_command = False
-        for c, val in parse_commands(text):
-            executed_command = True
-            if c == "h":
-                if val is None:
-                    # 値未指定ならトグル
-                    val = not s["show_hira"]
-                set_state(chat_id, show_hira=val)
-                reply_message(
-                    ev["replyToken"],
-                    f"Đã {'bật' if val else 'tắt'} hiển thị Hiragana."
-                )
-            elif c == "r":
-                if val is None:
-                    val = not s["show_romaji"]
-                set_state(chat_id, show_romaji=val)
-                reply_message(
-                    ev["replyToken"],
-                    f"Đã {'bật' if val else 'tắt'} hiển thị Romaji."
-                )
-            elif c == "status":
-                s = get_state(chat_id)
-                reply_message(
-                    ev["replyToken"],
-                    "Cài đặt hiện tại\n"
-                    f"- Hiragana: {'ON' if s['show_hira'] else 'OFF'}\n"
-                    f"- Romaji: {'ON' if s['show_romaji'] else 'OFF'}"
-                )
-        if executed_command:
-            # コマンドだった場合はここで次イベントへ（翻訳はしない）
+        # コマンド
+        cmd, val = parse_command(text)
+        if cmd == "hira":
+            set_state(chat_id, show_hira=val)
+            reply_message(ev["replyToken"], f"Đã {'bật' if val else 'tắt'} hiển thị Hiragana.")
+            continue
+        if cmd == "romaji":
+            set_state(chat_id, show_romaji=val)
+            reply_message(ev["replyToken"], f"Đã {'bật' if val else 'tắt'} hiển thị Romaji.")
+            continue
+        if cmd == "status":
+            s = get_state(chat_id)
+            reply_message(
+                ev["replyToken"],
+                f"Cài đặt hiện tại\n- Hiragana: {'ON' if s['show_hira'] else 'OFF'}\n- Romaji: {'ON' if s['show_romaji'] else 'OFF'}"
+            )
             continue
 
-        # ----- 翻訳 -----
+        # 翻訳
         src_lang, translated = guess_and_translate(text)
         s = get_state(chat_id)
 
         lines = []
         if src_lang == "VI":
-            # VI→JA（読み/ローマ字は日本語文に対してだけ付与）
             lines.append("[VN→JP]")
             lines.append(translated)
             if s["show_hira"]:
@@ -222,14 +241,12 @@ def webhook():
             if s["show_romaji"]:
                 lines.append(f"(romaji) {to_romaji(translated, spaced=True)}")
         else:
-            # JA→VI（読み付与はしない）
             lines.append("[JP→VN]")
             lines.append(translated)
 
         reply_message(ev["replyToken"], "\n".join(lines))
 
     return "OK", 200
-
 
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "8080"))
