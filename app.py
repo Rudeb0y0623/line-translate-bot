@@ -46,15 +46,15 @@ def guess_and_translate(text: str):
 # ========= 形態素・かな/ローマ字 =========
 _sudachi = dictionary.Dictionary().create()
 _SPLIT = sudachi_tokenizer.Tokenizer.SplitMode.C
-# カタカナ→ひらがな変換表
+# カタカナ→ひらがな
 _katakana_to_hira = str.maketrans({chr(k): chr(k - 0x60) for k in range(ord("ァ"), ord("ヶ") + 1)})
 
-# pykakasi（ローマ字変換器）
+# pykakasi（ローマ字）
 _kakasi = kakasi()
-_kakasi.setMode("H", "a")  # ひらがな→ローマ字
+_kakasi.setMode("H", "a")          # ひらがな→ローマ字
 _romaji_conv = _kakasi.getConverter()
 
-# ===== 価格だけ漢数字化（必要なければ convert_prices_to_kanji を呼ばない） =====
+# ===== 価格だけ漢数字化 =====
 _DIG = "零一二三四五六七八九"
 _UNIT1 = ["", "十", "百", "千"]
 _UNIT4 = ["", "万", "億", "兆"]
@@ -99,31 +99,23 @@ def convert_prices_to_kanji(text: str) -> str:
     text = _price_patterns[5].sub(vnd_post, text)
     return text
 
-# ====== ここから“きごう完全封じ”版 ======
-# 空白（半角/全角/改行/タブ など）なら True
+# ====== “きごう完全封じ”まわり ======
 def _is_whitespace(s: str) -> bool:
     return bool(s) and all(ch.isspace() for ch in s)
 
-# Sudachi → ひらがな（空白はスキップ、句読点など記号は素通し）
 def _token_to_hira(t) -> str:
     pos0 = t.part_of_speech()[0]
     surf = t.surface()
-    # 空白は絶対に返さない（後で自前で整形）
     if _is_whitespace(surf):
         return ""
-    # 記号はそのまま返す（"記号"という語に変換しない）
     if pos0 in ("記号", "補助記号"):
         return surf
-    # 英数字はそのまま
     if re.fullmatch(r"[0-9A-Za-z]+", surf):
         return surf
-    # 読みが無ければ表層
     yomi = t.reading_form()
     return surf if yomi == "*" else yomi.translate(_katakana_to_hira)
 
-# ひらがな化：助動詞の連続を左語に結合
 def to_hiragana(text: str, spaced: bool = False) -> str:
-    # 全角空白は一旦半角に統一（句読点は残す）
     text = convert_prices_to_kanji(text).replace("\u3000", " ")
     tokens = list(_sudachi.tokenize(text, _SPLIT))
 
@@ -131,14 +123,12 @@ def to_hiragana(text: str, spaced: bool = False) -> str:
     i = 0
     while i < len(tokens):
         t = tokens[i]
-        # 空白トークンは完全スキップ
         if _is_whitespace(t.surface()):
             i += 1
             continue
 
         merged = _token_to_hira(t)
         j = i + 1
-        # 直後の助動詞を全て結合（〜ます／〜た／〜たい…）
         while j < len(tokens):
             tj = tokens[j]
             if _is_whitespace(tj.surface()):
@@ -154,7 +144,6 @@ def to_hiragana(text: str, spaced: bool = False) -> str:
         i = j
 
     if spaced:
-        # 語間だけ1スペース。句読点の直前スペースは削除
         out = " ".join(chunks)
         out = re.sub(r"\s+", " ", out).strip()
         out = re.sub(r"\s+([、。！？!?])", r"\1", out)
@@ -162,22 +151,33 @@ def to_hiragana(text: str, spaced: bool = False) -> str:
     else:
         return "".join(chunks)
 
-# ローマ字化：ひらがなだけを対象に。記号/空白/数字/英字は素通し
-_HIRA_ONLY = re.compile(r"^[\u3041-\u3096\u309D\u309E\u30FC]+$")  # ひらがな + ょょ類/゛/゜/長音
+# ---- ここを強化：句読点付きトークンもローマ字化 ----
+_HIRA = r"\u3041-\u3096\u309D\u309E\u30FC"
+_HIRA_ONLY = re.compile(rf"^[{_HIRA}]+$")
+_TRAIL_PUNCTS = re.compile(rf"([{_HIRA}]+)([、。.,!?！？…]+)$")  # 末尾句読点抽出
+
 def to_romaji(text: str, spaced: bool = False) -> str:
-    hira_spaced = to_hiragana(text, spaced=True)  # ここで既に助動詞は結合済み
+    hira_spaced = to_hiragana(text, spaced=True)
     out_parts = []
     for tok in hira_spaced.split(" "):
         if tok == "":
             continue
+
+        # 末尾に句読点が付いている場合：「しました。」→ core=しました, punc=。
+        m = _TRAIL_PUNCTS.match(tok)
+        if m:
+            core, punc = m.group(1), m.group(2)
+            rom = _romaji_conv.do(core)
+            out_parts.append(rom + punc)
+            continue
+
         if _HIRA_ONLY.fullmatch(tok):
             out_parts.append(_romaji_conv.do(tok))
         else:
-            # 記号・数字・英字・漢字/カタカナ混じり等はそのまま
             out_parts.append(tok)
+
     out = " ".join(out_parts)
-    # 句読点前の余分なスペース除去
-    out = re.sub(r"\s+([,.\u3001\u3002!?])", r"\1", out)
+    out = re.sub(r"\s+([,.\u3001\u3002!?！？…])", r"\1", out)
     return out if spaced else out.replace(" ", "")
 
 # ========= LINE 返信 =========
@@ -188,7 +188,7 @@ def reply_message(reply_token: str, text: str):
     requests.post("https://api.line.me/v2/bot/message/reply",
                   headers=headers, data=json.dumps(body), timeout=15)
 
-# ========= 状態管理（メモリ） =========
+# ========= 状態管理 =========
 state = {}
 DEFAULTS = {"show_hira": True, "show_romaji": True}
 
@@ -219,7 +219,6 @@ def parse_command(text: str):
 def health():
     return "ok", 200
 
-# 入力の先頭に [JP→VN] / [VN→JP] などが付いていたら除去
 TAG_PREFIX_RE = re.compile(r'^\[\s*(?:JP|JA|VN|VI)\s*[\-→]\s*(?:JP|JA|VN|VI)\s*\]\s*', re.IGNORECASE)
 
 # ========= Webhook =========
@@ -242,12 +241,10 @@ def webhook():
 
         text = TAG_PREFIX_RE.sub("", msg.get("text") or "", count=1)
 
-        # チャット単位の設定
         src = ev.get("source", {})
         chat_id = src.get("groupId") or src.get("roomId") or src.get("userId")
         s = get_state(chat_id)
 
-        # コマンド
         cmd, val = parse_command(text)
         if cmd == "hira":
             set_state(chat_id, show_hira=val)
@@ -264,7 +261,6 @@ def webhook():
             )
             continue
 
-        # 翻訳
         src_lang, translated = guess_and_translate(text)
 
         lines = []
