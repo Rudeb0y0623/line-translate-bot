@@ -3,11 +3,15 @@ from flask import Flask, request
 from pykakasi import kakasi
 from sudachipy import dictionary, tokenizer as sudachi_tokenizer
 
+# ---- 追加 import（OCR/Tesseract）----
+import cv2
+import numpy as np
+import pytesseract
+
 # ========= 環境変数 =========
 LINE_CHANNEL_SECRET = os.environ["LINE_CHANNEL_SECRET"]
 LINE_CHANNEL_ACCESS_TOKEN = os.environ["LINE_CHANNEL_ACCESS_TOKEN"]
 DEEPL_API_KEY = os.environ["DEEPL_API_KEY"]
-OCRSPACE_API_KEY = os.environ.get("OCRSPACE_API_KEY", "")  # ← 追加（必須）
 
 app = Flask(__name__)
 
@@ -53,7 +57,7 @@ _kakasi = kakasi()
 _kakasi.setMode("H", "a")  # ひらがな→ローマ字
 _romaji_conv = _kakasi.getConverter()
 
-# ===== 価格を漢数字に（必要箇所のみ） =====
+# ===== 価格だけ漢数字化 =====
 _DIG = "零一二三四五六七八九"
 _UNIT1 = ["", "十", "百", "千"]
 _UNIT4 = ["", "万", "億", "兆"]
@@ -71,6 +75,7 @@ def num_to_kanji(num: int) -> str:
         n = num % 10000
         if n: parts.append(_four_digits_to_kanji(n) + _UNIT4[i])
         num //= 10000; i += 1
+        if i > 6: break
     return "".join(reversed(parts)) or _DIG[0]
 _price_patterns = [
     re.compile(r"(¥)\s*(\d{1,3}(?:,\d{3})+|\d+)"),
@@ -142,7 +147,7 @@ def to_hiragana(text: str, spaced: bool = False) -> str:
 
 _HIRA_CHAR = re.compile(r"[\u3041-\u3096\u309D\u309E\u30FC]")  # ひらがな＋長音
 def to_romaji(text: str, spaced: bool = False) -> str:
-    # 1文字単位で変換して「ひらがな混入」を完全排除
+    # 1文字単位で変換して「ローマ字にひらがな混入」を完全排除
     hira_spaced = to_hiragana(text, spaced=True)
     out_parts = []
     for tok in hira_spaced.split(" "):
@@ -188,45 +193,51 @@ def parse_command(text: str):
     if m: return ("romaji", m.group(2) == "on")
     return (None, None)
 
-# ========= ヘルス =========
+# ========= 健康確認 =========
 @app.route("/", methods=["GET"])
 def health():
     return "ok", 200
 
+# 先頭の [JP→VN] 等を除去
 TAG_PREFIX_RE = re.compile(r'^\[\s*(?:JP|JA|VN|VI)\s*[\-→]\s*(?:JP|JA|VN|VI)\s*\]\s*', re.IGNORECASE)
 
-# ========= OCR.space 画像→文字 =========
-def ocrspace_parse_image(image_bytes: bytes) -> str:
-    if not OCRSPACE_API_KEY:
-        return ""
-    url = "https://api.ocr.space/parse/image"
-    files = {"file": ("image.jpg", image_bytes)}
-    data = {
-        "apikey": OCRSPACE_API_KEY,
-        "language": "jpn,eng,vie",  # 日本語・英語・ベトナム語
-        "isOverlayRequired": False,
-        "OCREngine": 2,   # 現行エンジン
-        "scale": True,
-        "detectOrientation": True,
-    }
-    r = requests.post(url, files=files, data=data, timeout=60)
-    r.raise_for_status()
-    jr = r.json()
-    if not jr.get("IsErroredOnProcessing") and jr.get("ParsedResults"):
-        text = jr["ParsedResults"][0].get("ParsedText", "")
-        # OCRは改行が多く混ざるので軽く整える（空行圧縮）
-        text = re.sub(r"\r", "", text)
-        text = re.sub(r"\n{3,}", "\n\n", text).strip()
-        return text
-    return ""
-
-# ========= LINEの画像データ取得 =========
+# ========= LINE 画像取得 =========
 def get_line_message_content(message_id: str) -> bytes:
     url = f"https://api-data.line.me/v2/bot/message/{message_id}/content"
     headers = {"Authorization": f"Bearer {LINE_CHANNEL_ACCESS_TOKEN}"}
     r = requests.get(url, headers=headers, timeout=60)
     r.raise_for_status()
     return r.content
+
+# ========= Tesseract 前処理 & OCR =========
+def _preprocess_for_ocr(image_bytes: bytes) -> np.ndarray:
+    arr = np.frombuffer(image_bytes, np.uint8)
+    img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+    if img is None:
+        raise ValueError("decode failed")
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    # 照明ムラに強い自適応二値化
+    th = cv2.adaptiveThreshold(gray, 255,
+                               cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                               cv2.THRESH_BINARY, 35, 11)
+    return th
+
+# 日本語・ベトナム語・英語を順番に試す（最初に jpn）
+_LANGS = ["jpn", "vie", "eng"]
+_VALID_TEXT = re.compile(r"[A-Za-zÀ-ỹ一-龥ぁ-んァ-ン]")
+
+def ocr_tesseract(image_bytes: bytes) -> str:
+    proc = _preprocess_for_ocr(image_bytes)
+    for lang in _LANGS:
+        try:
+            txt = pytesseract.image_to_string(proc, lang=lang, config="--oem 3 --psm 6")
+            txt = (txt or "").replace("\u3000", " ").strip()
+            # 空/記号のみは無効
+            if txt and _VALID_TEXT.search(txt):
+                return txt
+        except Exception:
+            continue
+    return ""
 
 # ========= Webhook =========
 @app.route("/webhook", methods=["POST"])
@@ -249,22 +260,21 @@ def webhook():
         chat_id = src.get("groupId") or src.get("roomId") or src.get("userId")
         s = get_state(chat_id)
 
-        # ===== 画像 → OCR → 翻訳 =====
+        # ===== 画像 → Tesseract OCR → 翻訳 =====
         if mtype == "image":
             try:
                 img_bytes = get_line_message_content(msg["id"])
-                ocr_text = ocrspace_parse_image(img_bytes)
+                ocr_text = ocr_tesseract(img_bytes)
             except Exception:
                 ocr_text = ""
-
-            if not ocr_text.strip():
+            if not ocr_text:
                 reply_message(ev["replyToken"], "[画像OCR] 文字が見つかりませんでした。")
                 continue
 
             src_lang, translated = guess_and_translate(ocr_text)
             out = []
             out.append("[OCR原文]")
-            out.append(ocr_text[:1500])  # 長すぎる原文は少し抑制
+            out.append(ocr_text[:1500])  # 長すぎる原文は抑制
             if src_lang == "VI":
                 out.append("\n[VN→JP]")
                 out.append(translated)
@@ -294,8 +304,10 @@ def webhook():
             reply_message(ev["replyToken"], f"Đã {'bật' if val else 'tắt'} hiển thị Romaji.")
             continue
         if cmd == "status":
-            reply_message(ev["replyToken"],
-                          f"Cài đặt hiện tại\n- Hiragana: {'ON' if s['show_hira'] else 'OFF'}\n- Romaji: {'ON' if s['show_romaji'] else 'OFF'}")
+            reply_message(
+                ev["replyToken"],
+                f"Cài đặt hiện tại\n- Hiragana: {'ON' if s['show_hira'] else 'OFF'}\n- Romaji: {'ON' if s['show_romaji'] else 'OFF'}"
+            )
             continue
 
         src_lang, translated = guess_and_translate(text)
