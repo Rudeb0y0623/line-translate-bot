@@ -7,6 +7,7 @@ from sudachipy import dictionary, tokenizer as sudachi_tokenizer
 LINE_CHANNEL_SECRET = os.environ["LINE_CHANNEL_SECRET"]
 LINE_CHANNEL_ACCESS_TOKEN = os.environ["LINE_CHANNEL_ACCESS_TOKEN"]
 DEEPL_API_KEY = os.environ["DEEPL_API_KEY"]
+OCRSPACE_API_KEY = os.environ.get("OCRSPACE_API_KEY", "")  # なくても起動はする
 
 app = Flask(__name__)
 
@@ -46,12 +47,10 @@ def guess_and_translate(text: str):
 # ========= 形態素・かな/ローマ字 =========
 _sudachi = dictionary.Dictionary().create()
 _SPLIT = sudachi_tokenizer.Tokenizer.SplitMode.C
-# カタカナ→ひらがな
 _katakana_to_hira = str.maketrans({chr(k): chr(k - 0x60) for k in range(ord("ァ"), ord("ヶ") + 1)})
 
-# pykakasi（ローマ字）
 _kakasi = kakasi()
-_kakasi.setMode("H", "a")          # ひらがな→ローマ字
+_kakasi.setMode("H", "a")  # ひらがな→ローマ字
 _romaji_conv = _kakasi.getConverter()
 
 # ===== 価格だけ漢数字化 =====
@@ -99,7 +98,7 @@ def convert_prices_to_kanji(text: str) -> str:
     text = _price_patterns[5].sub(vnd_post, text)
     return text
 
-# ====== “きごう完全封じ”まわり ======
+# ====== “きごう完全封じ” かな/ローマ字 ======
 def _is_whitespace(s: str) -> bool:
     return bool(s) and all(ch.isspace() for ch in s)
 
@@ -118,7 +117,6 @@ def _token_to_hira(t) -> str:
 def to_hiragana(text: str, spaced: bool = False) -> str:
     text = convert_prices_to_kanji(text).replace("\u3000", " ")
     tokens = list(_sudachi.tokenize(text, _SPLIT))
-
     chunks = []
     i = 0
     while i < len(tokens):
@@ -126,23 +124,19 @@ def to_hiragana(text: str, spaced: bool = False) -> str:
         if _is_whitespace(t.surface()):
             i += 1
             continue
-
         merged = _token_to_hira(t)
         j = i + 1
         while j < len(tokens):
             tj = tokens[j]
             if _is_whitespace(tj.surface()):
-                j += 1
-                continue
+                j += 1; continue
             if tj.part_of_speech()[0] == "助動詞":
-                merged += _token_to_hira(tj)
-                j += 1
+                merged += _token_to_hira(tj); j += 1
             else:
                 break
         if merged:
             chunks.append(merged)
         i = j
-
     if spaced:
         out = " ".join(chunks)
         out = re.sub(r"\s+", " ", out).strip()
@@ -151,33 +145,18 @@ def to_hiragana(text: str, spaced: bool = False) -> str:
     else:
         return "".join(chunks)
 
-# ---- ここを強化：句読点付きトークンもローマ字化 ----
-_HIRA = r"\u3041-\u3096\u309D\u309E\u30FC"
-_HIRA_ONLY = re.compile(rf"^[{_HIRA}]+$")
-_TRAIL_PUNCTS = re.compile(rf"([{_HIRA}]+)([、。.,!?！？…]+)$")  # 末尾句読点抽出
-
+_HIRA_ONLY = re.compile(r"^[\u3041-\u3096\u309D\u309E\u30FC]+$")
 def to_romaji(text: str, spaced: bool = False) -> str:
     hira_spaced = to_hiragana(text, spaced=True)
     out_parts = []
     for tok in hira_spaced.split(" "):
-        if tok == "":
-            continue
-
-        # 末尾に句読点が付いている場合：「しました。」→ core=しました, punc=。
-        m = _TRAIL_PUNCTS.match(tok)
-        if m:
-            core, punc = m.group(1), m.group(2)
-            rom = _romaji_conv.do(core)
-            out_parts.append(rom + punc)
-            continue
-
+        if tok == "": continue
         if _HIRA_ONLY.fullmatch(tok):
             out_parts.append(_romaji_conv.do(tok))
         else:
             out_parts.append(tok)
-
     out = " ".join(out_parts)
-    out = re.sub(r"\s+([,.\u3001\u3002!?！？…])", r"\1", out)
+    out = re.sub(r"\s+([,.\u3001\u3002!?])", r"\1", out)
     return out if spaced else out.replace(" ", "")
 
 # ========= LINE 返信 =========
@@ -214,12 +193,52 @@ def parse_command(text: str):
     if m: return ("romaji", m.group(2) == "on")
     return (None, None)
 
-# ========= ルート =========
+# ========= 健康確認 =========
 @app.route("/", methods=["GET"])
 def health():
     return "ok", 200
 
+# ========= 先頭の [JP→VN] 等を除去 =========
 TAG_PREFIX_RE = re.compile(r'^\[\s*(?:JP|JA|VN|VI)\s*[\-→]\s*(?:JP|JA|VN|VI)\s*\]\s*', re.IGNORECASE)
+
+# ========= 画像取得（LINEコンテンツAPI） =========
+def fetch_line_content(message_id: str) -> bytes:
+    url = f"https://api-data.line.me/v2/bot/message/{message_id}/content"
+    headers = {"Authorization": f"Bearer {LINE_CHANNEL_ACCESS_TOKEN}"}
+    r = requests.get(url, headers=headers, timeout=30)
+    r.raise_for_status()
+    return r.content  # バイナリ
+
+# ========= OCR.space 呼び出し（日本語優先→失敗時ベトナム語→英語） =========
+def ocr_space_extract(image_bytes: bytes) -> str:
+    if not OCRSPACE_API_KEY:
+        return ""
+    api = "https://api.ocr.space/parse/image"
+    files = {"file": ("image.jpg", image_bytes)}
+    # 日本語を最優先
+    langs = ["jpn", "vie", "eng"]
+    for lang in langs:
+        data = {
+            "language": lang,
+            "OCREngine": 2,
+            "isOverlayRequired": False,
+            "scale": True,
+            "detectOrientation": True,
+            "apikey": OCRSPACE_API_KEY,
+        }
+        r = requests.post(api, data=data, files=files, timeout=60)
+        try:
+            r.raise_for_status()
+            js = r.json()
+        except Exception:
+            continue
+        if js.get("IsErroredOnProcessing"):
+            continue
+        parsed = (js.get("ParsedResults") or [{}])[0].get("ParsedText", "") or ""
+        parsed = parsed.replace("\r", "").strip()
+        if parsed:
+            return parsed
+    return ""
 
 # ========= Webhook =========
 @app.route("/webhook", methods=["POST"])
@@ -232,19 +251,64 @@ def webhook():
         return "bad signature", 400
 
     data = request.get_json(silent=True) or {}
+
     for ev in data.get("events", []):
         if ev.get("type") != "message":
             continue
         msg = ev.get("message", {})
-        if msg.get("type") != "text":
+        mtype = msg.get("type")
+
+        # ===== 画像 → OCR → 翻訳 =====
+        if mtype == "image":
+            reply_token = ev.get("replyToken")
+            try:
+                img = fetch_line_content(msg.get("id"))
+                ocr_text = ocr_space_extract(img)
+            except Exception:
+                ocr_text = ""
+
+            if not ocr_text:
+                reply_message(reply_token, "【画像OCR】文字が見つかりませんでした。")
+                continue
+
+            # 翻訳（通常のロジック）
+            src_lang, translated = guess_and_translate(ocr_text)
+
+            # チャット単位の設定
+            src = ev.get("source", {})
+            chat_id = src.get("groupId") or src.get("roomId") or src.get("userId")
+            s = get_state(chat_id)
+
+            lines = []
+            lines.append("【画像OCR】原文")
+            lines.append(ocr_text)
+
+            if src_lang == "VI":
+                lines.append("\n[VN→JP]")
+                lines.append(translated)
+                if s["show_hira"]:
+                    lines.append(f"\n(hiragana) {to_hiragana(translated, spaced=True)}")
+                if s["show_romaji"]:
+                    lines.append(f"(romaji) {to_romaji(translated, spaced=True)}")
+            else:
+                lines.append("\n[JP→VN]")
+                lines.append(translated)
+
+            reply_message(reply_token, "\n".join(lines))
+            continue
+
+        # ===== テキスト =====
+        if mtype != "text":
             continue
 
         text = TAG_PREFIX_RE.sub("", msg.get("text") or "", count=1)
 
+        # チャット単位の設定
         src = ev.get("source", {})
         chat_id = src.get("groupId") or src.get("roomId") or src.get("userId")
         s = get_state(chat_id)
 
+        # コマンド
         cmd, val = parse_command(text)
         if cmd == "hira":
             set_state(chat_id, show_hira=val)
@@ -261,6 +325,7 @@ def webhook():
             )
             continue
 
+        # 翻訳
         src_lang, translated = guess_and_translate(text)
 
         lines = []
