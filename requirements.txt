@@ -4,3 +4,5 @@ requests==2.32.3
 pykakasi==2.3.0
 sudachipy==0.6.8
 sudachidict_core==20240109
+opencv-python-headless==4.10.0.84
+pytesseract==0.3.13
