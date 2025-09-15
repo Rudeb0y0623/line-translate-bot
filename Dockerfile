@@ -1,23 +1,18 @@
 FROM python:3.11-slim
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1
-
-# OCR & 画像処理に必要なランタイム
-RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-    tesseract-ocr \
-    tesseract-ocr-jpn \
-    tesseract-ocr-vie \
-    libtesseract-dev \
-    libgl1 \
-    libglib2.0-0 \
-    && rm -rf /var/lib/apt/lists/*
+    PYTHONUNBUFFERED=1 \
+    LANG=C.UTF-8
 
 WORKDIR /app
+
+# 依存を先に入れてキャッシュを効かせる
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
+# アプリ本体
 COPY app.py .
 
 EXPOSE 8080
-CMD gunicorn -w 2 -b 0.0.0.0:$PORT app:app
+# Render の無料枠で安定しやすい設定：ワーカー1つ
+CMD gunicorn -w 1 -b 0.0.0.0:$PORT app:app
